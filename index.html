@@ -1,59 +1,654 @@
-/* sw.js - cache semplice per offline + riduzione problemi di cache
-   Se fai modifiche grandi, cambia CACHE_VERSION (es. v3 -> v4). */
-const CACHE_VERSION = "moto-runner-v3";
-const CORE = [
-  "./",
-  "./index.html",
-  "./manifest.webmanifest",
-  "./faccia_scontornata.png" // se non c’è, toglila o caricala
-];
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
 
-self.addEventListener("install", (event) => {
-  self.skipWaiting();
-  event.waitUntil(
-    caches.open(CACHE_VERSION).then((cache) => cache.addAll(CORE).catch(()=>{}))
-  );
-});
+  <!-- Fullscreen "app-like" su iPhone: funziona quando avvii da Home Screen -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Moto Runner" />
 
-self.addEventListener("activate", (event) => {
-  event.waitUntil((async () => {
-    const keys = await caches.keys();
-    await Promise.all(keys.map(k => (k !== CACHE_VERSION) ? caches.delete(k) : Promise.resolve()));
-    await self.clients.claim();
-  })());
-});
+  <title>Moto Runner</title>
 
-// Network-first per HTML (così vedi gli update), cache-first per assets
-self.addEventListener("fetch", (event) => {
-  const req = event.request;
-  const url = new URL(req.url);
+  <style>
+    html, body { height: 100%; margin: 0; background:#fff; }
+    body{
+      overflow:hidden;
+      touch-action: none;
+      user-select:none; -webkit-user-select:none;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+    }
+    canvas{
+      position:fixed;
+      inset:0;
+      width:100vw;
+      height:100vh;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      background:#fff;
+    }
+  </style>
+</head>
 
-  // solo stessa origin
-  if (url.origin !== self.location.origin) return;
+<body>
+<canvas id="c" aria-label="Moto Runner"></canvas>
 
-  const isHTML = req.mode === "navigate" || url.pathname.endsWith(".html") || url.pathname.endsWith("/moto-runner/") || url.pathname.endsWith("/moto-runner");
-  if (isHTML) {
-    event.respondWith((async () => {
-      try {
-        const fresh = await fetch(req, { cache: "no-store" });
-        const cache = await caches.open(CACHE_VERSION);
-        cache.put(req, fresh.clone()).catch(()=>{});
-        return fresh;
-      } catch {
-        const cached = await caches.match(req);
-        return cached || caches.match("./index.html");
-      }
-    })());
-    return;
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha: false });
+
+  // ====== CONFIG ======
+  const VERSION_TAG = "v1";        // cambia se vuoi forzare refresh asset (?v=)
+  const USE_BLOOD_RED = true;      // false = sangue in nero (più coerente B/N)
+  const BLOOD_COLOR = USE_BLOOD_RED ? "#8b0000" : "#000";
+
+  // Sprite player (fallback incluso)
+  const motoImg = new Image();
+  const MOTO_FALLBACK_B64 =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABcAAAASCAYAAACw50UTAAAAkUlEQVR4nLVU0Q6AIBDS5v//sr1Uu50g3Cq2tjQOPDRb8zCvp4QRij9HNzjR2OE/OP4SVuKvo2LiSDjPyU1GrVZXTONSmUeBLBLHsAtX/BZAY9pp3300EOuXeAaYRGZoEfJoqqJdV4rXUeZuTDJzVuQUZPGZ39UfykxmMzIfirAxyFjM2FGsXFLMHG5o9faj/BO3NCgO4jsV/AAAAABJRU5ErkJggg==";
+
+  // Metti nel repo (root) il png: faccia_scontornata.png
+  // Per tornare alla moto precedente: carica un PNG moto e cambia il nome qui.
+  motoImg.onerror = () => { motoImg.src = MOTO_FALLBACK_B64; };
+  motoImg.src = `faccia_scontornata.png?${VERSION_TAG}`;
+
+  // ====== WORLD ======
+  const VW = 260;
+  const VH = 140;
+  let SCALE = 1;
+
+  function resize() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    SCALE = Math.max(1, Math.floor(Math.min(w / VW, h / VH)));
+    canvas.width  = VW * SCALE;
+    canvas.height = VH * SCALE;
+    ctx.setTransform(SCALE, 0, 0, SCALE, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+  }
+  window.addEventListener("resize", resize, { passive:true });
+  resize();
+
+  // ====== HELPERS ======
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp  = (a,b,t)=>a+(b-a)*t;
+  const rand  = (a,b)=>a+Math.random()*(b-a);
+  const isPortrait = ()=> window.innerHeight > window.innerWidth;
+
+  function aabb(ax, ay, aw, ah, bx, by, bw, bh){
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
   }
 
-  // assets: cache-first
-  event.respondWith((async () => {
-    const cached = await caches.match(req);
-    if (cached) return cached;
-    const fresh = await fetch(req);
-    const cache = await caches.open(CACHE_VERSION);
-    cache.put(req, fresh.clone()).catch(()=>{});
-    return fresh;
-  })());
-});
+  // ====== FULLSCREEN (desktop/Android). iOS Safari è limitato: usare “Aggiungi a Home”. ======
+  // requestFullscreen è "best effort" (non blocca se non supportato). :contentReference[oaicite:2]{index=2}
+  function tryFullscreen(){
+    const el = canvas;
+    const fn = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+    if (fn) { try { fn.call(el); } catch {} }
+  }
+
+  // ====== ROAD (pre-render base + pattern) ======
+  const LANES = 3;
+  const road = { x: 0, y: (VH * 0.5) - 45, w: VW, h: 90, shoulder: 8 };
+  const laneFracs = [0.28, 0.50, 0.72];
+  const laneY = (lane)=> road.y + road.h * laneFracs[clamp(lane|0, 0, LANES-1)];
+
+  // Offscreen base
+  const roadBase = document.createElement("canvas");
+  roadBase.width = VW; roadBase.height = VH;
+  const rctx = roadBase.getContext("2d");
+  rctx.imageSmoothingEnabled = false;
+
+  function buildRoadBase(){
+    rctx.fillStyle = "#fff";
+    rctx.fillRect(0,0,VW,VH);
+
+    rctx.strokeStyle = "#000";
+    rctx.lineWidth = 1;
+    rctx.strokeRect(road.x, road.y, road.w, road.h);
+
+    rctx.fillStyle = "#000";
+    rctx.fillRect(0, road.y + road.shoulder, VW, 1);
+    rctx.fillRect(0, road.y + road.h - road.shoulder - 1, VW, 1);
+
+    // guardrail lines
+    rctx.fillRect(0, road.y - 6, VW, 1);
+    rctx.fillRect(0, road.y + road.h + 5, VW, 1);
+  }
+  buildRoadBase();
+
+  function makePattern(w,h,drawFn){
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const p = c.getContext("2d");
+    p.imageSmoothingEnabled = false;
+    drawFn(p,w,h);
+    return ctx.createPattern(c, "repeat");
+  }
+
+  const dashW = 10, dashGap = 10;
+  const dashPat = makePattern(dashW+dashGap, 1, (p)=>{
+    p.fillStyle="#000"; p.fillRect(0,0,dashW,1);
+  });
+
+  const rumbleGap = 10;
+  const rumblePat = makePattern(rumbleGap, 2, (p)=>{
+    p.fillStyle="#000"; p.fillRect(0,0,1,2);
+  });
+
+  const postGap = 16;
+  const postPat = makePattern(postGap, 4, (p)=>{
+    p.fillStyle="#000"; p.fillRect(0,0,1,4);
+  });
+
+  // ====== STATE ======
+  const state = {
+    dead: false,
+    lastTs: 0,
+    score: 0,
+    hi: Number(localStorage.getItem("moto_hi_onefile") || 0),
+    level: 0,
+
+    speedBase: 70,
+    speedStep: 14,
+    speedMax: 220,
+    speed: 70,
+
+    spawnTimer: 0,
+    spawnMin: 0.85,
+    spawnMax: 1.35,
+
+    scroll: 0,
+
+    // HUD throttled
+    hudT: 0,
+    hudStr: "",
+
+    // patterns + warnings
+    patternQ: [],
+    warnings: [],
+
+    // debug
+    showHitbox: false,
+
+    // a2hs detection
+    standalone:
+      (typeof navigator !== "undefined" && navigator.standalone === true) ||
+      (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches),
+
+    // blood
+    blood: []
+  };
+
+  // ====== PLAYER ======
+  const SPR = { motoW: 23, motoH: 18 };
+  const player = {
+    x: 26,
+    y: laneY(1),        // bottom position (float)
+    targetY: laneY(1),
+    w: SPR.motoW,
+    h: SPR.motoH,
+    hit: { x: 5, y: 7, w: Math.max(10, SPR.motoW - 10), h: Math.max(8, SPR.motoH - 10) }
+  };
+  const playerMinBottom = ()=> road.y + player.h + 2;
+  const playerMaxBottom = ()=> road.y + road.h - 2;
+
+  // ====== OBSTACLES ======
+  const obstacles = [];
+  const OB_SPAWN_X = VW + 14;
+  const OB_DESPAWN_X = -40;
+
+  const randomLane = ()=> (Math.random()*LANES)|0;
+
+  function obstacleSizeForLevel(){
+    const baseW = 6, baseH = 16;
+    const s = clamp(1 + state.level * 0.02, 1, 1.18);
+    return { w: Math.max(5, (baseW*s)|0), h: Math.max(14, (baseH*s)|0) };
+  }
+
+  function endLaneFor(startLane){
+    if (Math.random() < 0.75){
+      const adj = [];
+      if (startLane > 0) adj.push(startLane - 1);
+      if (startLane < LANES - 1) adj.push(startLane + 1);
+      return adj[(Math.random() * adj.length)|0];
+    } else {
+      let l;
+      do { l = randomLane(); } while (l === startLane);
+      return l;
+    }
+  }
+
+  function addWarning(lane){
+    state.warnings.push({ lane, t: 0.25, blink: 0 });
+  }
+
+  function makeObstacle(opts = {}){
+    const { w, h } = obstacleSizeForLevel();
+    const straightProb = 0.62;
+    const doSwitch = Math.random() > straightProb;
+
+    const startLane = (opts.startLane != null) ? opts.startLane : randomLane();
+    const endLane   = doSwitch ? endLaneFor(startLane) : startLane;
+
+    const y0 = laneY(startLane) + rand(-3,3);
+    const y1 = laneY(endLane)   + rand(-3,3);
+
+    const o = {
+      x: (opts.x != null ? opts.x : OB_SPAWN_X),
+      x0: OB_SPAWN_X,
+      x1: OB_DESPAWN_X,
+      y0, y1,
+      w, h,
+      curve: Math.random() < 0.35 ? rand(-0.35, 0.35) : 0,
+      startLane, endLane
+    };
+
+    // warning solo per traiettorie "non banali"
+    if (endLane !== startLane || o.curve !== 0){
+      addWarning(startLane);
+      addWarning(endLane);
+    }
+    return o;
+  }
+
+  function obstacleY(o){
+    const p = clamp((o.x0 - o.x) / (o.x0 - o.x1), 0, 1);
+    let t = p;
+    t = t*t*(3 - 2*t);
+    if (o.curve !== 0){
+      const s = Math.sin(p * Math.PI);
+      t = clamp(t + s * o.curve, 0, 1);
+    }
+    return lerp(o.y0, o.y1, t);
+  }
+
+  function drawObstacle(o){
+    const x = (o.x)|0;
+    const yMid = obstacleY(o);
+    const y = (yMid - o.h + 2)|0;
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(x, y+3, o.w, o.h-3);
+
+    const neckW = Math.max(2, o.w - 2);
+    const neckX = (x + ((o.w-neckW)/2))|0;
+    ctx.fillRect(neckX, y, neckW, 3);
+    ctx.fillRect(neckX, y-1, neckW, 1);
+    ctx.fillRect(x+1, y+o.h+1, Math.max(2,o.w-1), 1);
+  }
+
+  // ====== PATTERNS (più "gamey" senza stravolgere) ======
+  function enqueuePattern(){
+    const safe = randomLane();
+    const lanes = [0,1,2].filter(l=>l!==safe);
+
+    state.patternQ.push({dt: 0.00, lane: lanes[0], x: OB_SPAWN_X});
+    state.patternQ.push({dt: 0.00, lane: lanes[1], x: OB_SPAWN_X + 10});
+    state.patternQ.push({dt: 0.22, lane: safe,     x: OB_SPAWN_X + 18});
+  }
+
+  function spawnFromQueue(dt){
+    for (const p of state.patternQ) p.dt -= dt;
+    while (state.patternQ.length && state.patternQ[0].dt <= 0){
+      const p = state.patternQ.shift();
+      obstacles.push(makeObstacle({ startLane: p.lane, x: p.x }));
+    }
+  }
+
+  // ====== BLOOD ======
+  function spawnBlood(x, y){
+    state.blood.length = 0;
+    state.blood.push({x, y, r: 9, dx:0, dy:0, life:1.2});
+    for (let i=0;i<10;i++){
+      state.blood.push({
+        x, y,
+        r: rand(1.5, 3.5),
+        dx: rand(-75, 45),
+        dy: rand(-45, 70),
+        life: rand(0.6, 1.1)
+      });
+    }
+  }
+
+  function updateBlood(dt){
+    for (const b of state.blood){
+      if (b.life <= 0) continue;
+      b.life -= dt;
+      b.x += b.dx * dt;
+      b.y += b.dy * dt;
+      b.dx *= (1 - 2.6*dt);
+      b.dy *= (1 - 2.6*dt);
+    }
+  }
+
+  function drawBlood(){
+    if (!state.blood.length) return;
+    ctx.save();
+    ctx.fillStyle = BLOOD_COLOR;
+
+    for (const b of state.blood){
+      if (b.life <= 0) continue;
+      const alpha = clamp(b.life / 1.2, 0, 1);
+      ctx.globalAlpha = 0.25 + 0.75*alpha;
+
+      const x = (b.x)|0, y = (b.y)|0, r = (b.r)|0;
+      ctx.fillRect(x-r, y, r*2, 1);
+      ctx.fillRect(x, y-r, 1, r*2);
+      ctx.fillRect(x-r+1, y-r+1, Math.max(1,r*2-2), Math.max(1,r*2-2));
+    }
+
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  // ====== INPUT "SLIDER" più stabile ======
+  let dragging = false;
+  let activePointerId = null;
+  let dragOffset = 0;
+  let didTryFS = false;
+
+  function pointerToWorldY(e){
+    const rect = canvas.getBoundingClientRect();
+    return (e.clientY - rect.top) / rect.height * VH;
+  }
+  function setTargetFromPointer(e){
+    const fingerY = pointerToWorldY(e);
+    const desiredBottom = (fingerY + player.h*0.5) + dragOffset;
+    player.targetY = clamp(desiredBottom, playerMinBottom(), playerMaxBottom());
+  }
+
+  canvas.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    if (!didTryFS){ didTryFS = true; tryFullscreen(); }
+
+    if (isPortrait()) return;
+
+    if (state.dead){ reset(); return; }
+
+    dragging = true;
+    activePointerId = e.pointerId;
+    canvas.setPointerCapture(activePointerId);
+
+    const fingerY = pointerToWorldY(e);
+    const desiredBottom = (fingerY + player.h*0.5);
+    dragOffset = player.y - desiredBottom;
+
+    setTargetFromPointer(e);
+  }, { passive:false });
+
+  const onMove = (e) => {
+    if (!dragging) return;
+    if (e.pointerId !== activePointerId) return;
+    e.preventDefault();
+    setTargetFromPointer(e);
+  };
+  canvas.addEventListener("pointermove", onMove, { passive:false });
+  canvas.addEventListener("pointerrawupdate", onMove, { passive:false });
+
+  function endDrag(e){
+    if (e && e.pointerId !== activePointerId) return;
+    dragging = false;
+    activePointerId = null;
+  }
+  canvas.addEventListener("pointerup", (e) => { e.preventDefault(); endDrag(e); }, { passive:false });
+  canvas.addEventListener("pointercancel", (e) => { e.preventDefault(); endDrag(e); }, { passive:false });
+
+  // Debug hitbox: triplo tap in alto a sinistra
+  let tapC = 0, tapT = 0;
+  canvas.addEventListener("pointerup", (e)=>{
+    if (isPortrait()) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width * VW;
+    const y = (e.clientY - rect.top)  / rect.height * VH;
+    if (x < 35 && y < 25){
+      const now = performance.now();
+      if (now - tapT > 600) tapC = 0;
+      tapT = now;
+      tapC++;
+      if (tapC >= 3){
+        state.showHitbox = !state.showHitbox;
+        tapC = 0;
+      }
+    }
+  });
+
+  // ====== DRAW ROAD ======
+  function drawRoad(){
+    ctx.drawImage(roadBase, 0, 0);
+
+    const ySep1 = road.y + road.h * (1/3);
+    const ySep2 = road.y + road.h * (2/3);
+
+    ctx.fillStyle = dashPat;
+    ctx.save();
+    ctx.translate(-((state.scroll) % (dashW + dashGap)), 0);
+    ctx.fillRect(0, ySep1, VW + (dashW+dashGap), 1);
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(-(((state.scroll) + 8) % (dashW + dashGap)), 0);
+    ctx.fillRect(0, ySep2, VW + (dashW+dashGap), 1);
+    ctx.restore();
+
+    ctx.fillStyle = rumblePat;
+    ctx.save();
+    ctx.translate(-(((state.scroll) + 5) % rumbleGap), 0);
+    ctx.fillRect(0, road.y + 2, VW + rumbleGap, 2);
+    ctx.fillRect(0, road.y + road.h - 4, VW + rumbleGap, 2);
+    ctx.restore();
+
+    ctx.fillStyle = postPat;
+    ctx.save();
+    ctx.translate(-(((state.scroll) + 3) % postGap), 0);
+    ctx.fillRect(0, road.y - 10, VW + postGap, 4);
+    ctx.fillRect(0, road.y + road.h + 6, VW + postGap, 4);
+    ctx.restore();
+  }
+
+  // ====== WARNINGS ======
+  function updateWarnings(dt){
+    for (const w of state.warnings){
+      w.t -= dt;
+      w.blink += dt;
+    }
+    while (state.warnings.length && state.warnings[0].t <= 0) state.warnings.shift();
+  }
+
+  function drawWarnings(){
+    if (!state.warnings.length) return;
+    for (const w of state.warnings){
+      if ((w.blink % 0.08) < 0.04) continue;
+      const y = (laneY(w.lane) - 10)|0;
+      ctx.fillStyle = "#000";
+      ctx.fillRect(VW - 18, y, 10, 2);
+      ctx.fillRect(VW - 18, y+4, 14, 2);
+      ctx.fillRect(VW - 18, y+8, 8, 2);
+    }
+  }
+
+  // ====== HUD ======
+  function updateHUD(dt){
+    state.hudT -= dt;
+    if (state.hudT > 0) return;
+    state.hudT = 0.12;
+
+    const s  = Math.floor(state.score).toString().padStart(5,"0");
+    const hi = Math.floor(state.hi).toString().padStart(5,"0");
+    state.hudStr = `HI ${hi}  ${s}  LV ${state.level}`;
+  }
+
+  function drawHUD(){
+    ctx.fillStyle = "#000";
+    ctx.font = "6px ui-monospace, monospace";
+    ctx.fillText(state.hudStr, 6, 10);
+
+    if (isPortrait()){
+      ctx.font = "8px ui-monospace, monospace";
+      ctx.fillText("RUOTA IL TELEFONO", (VW/2 - 52)|0, (VH/2 - 6)|0);
+      ctx.font = "6px ui-monospace, monospace";
+      ctx.fillText("GIOCO IN ORIZZONTALE", (VW/2 - 64)|0, (VH/2 + 8)|0);
+      return;
+    }
+
+    if (!state.standalone){
+      ctx.font = "5px ui-monospace, monospace";
+      ctx.fillText("Per fullscreen iPhone: Condividi > Aggiungi a Home", 6, VH - 6);
+    }
+
+    if (state.dead){
+      ctx.font = "8px ui-monospace, monospace";
+      ctx.fillText("GAME OVER", (VW/2 - 34)|0, (VH/2 - 8)|0);
+      ctx.font = "6px ui-monospace, monospace";
+      ctx.fillText("TAP PER RIPARTIRE", (VW/2 - 44)|0, (VH/2 + 8)|0);
+    }
+  }
+
+  // ====== RESET ======
+  function reset(){
+    state.dead = false;
+    state.score = 0;
+    state.level = 0;
+    state.speed = state.speedBase;
+    state.spawnTimer = rand(state.spawnMin, state.spawnMax);
+    state.scroll = 0;
+    state.hudT = 0;
+    state.hudStr = "";
+    state.patternQ.length = 0;
+    state.warnings.length = 0;
+    obstacles.length = 0;
+    state.blood.length = 0;
+
+    const start = laneY(1);
+    player.y = start;
+    player.targetY = start;
+  }
+
+  // ====== UPDATE ======
+  function update(dt){
+    dt = Math.min(0.05, dt);  // anti-spike
+
+    // sangue continua anche da morto (effetto più "fisico")
+    if (state.blood.length) updateBlood(dt);
+
+    if (isPortrait()) return;
+
+    updateWarnings(dt);
+
+    if (state.dead) return;
+
+    state.score += dt * 10;
+    state.level = (state.score / 120) | 0;
+
+    state.speed = Math.min(state.speedMax, state.speedBase + state.level * state.speedStep);
+    state.scroll += state.speed * dt;
+
+    if (state.score > state.hi){
+      state.hi = state.score;
+      localStorage.setItem("moto_hi_onefile", String(Math.floor(state.hi)));
+    }
+
+    updateHUD(dt);
+
+    // smoothing player
+    player.y = player.y + (player.targetY - player.y) * Math.min(1, dt * 22);
+
+    // spawn pattern queue
+    if (state.patternQ.length) spawnFromQueue(dt);
+
+    // spawn base + pattern ogni tanto
+    state.spawnTimer -= dt;
+    if (state.spawnTimer <= 0){
+      const patProb = clamp(0.08 + state.level * 0.01, 0.08, 0.24);
+      if (Math.random() < patProb){
+        enqueuePattern();
+      } else {
+        obstacles.push(makeObstacle());
+
+        const duoProb = clamp(0.18 + state.level * 0.02, 0.18, 0.40);
+        if (Math.random() < duoProb){
+          obstacles.push(makeObstacle({
+            x: OB_SPAWN_X + rand(10, 26),
+            startLane: randomLane()
+          }));
+        }
+      }
+
+      const min = clamp(state.spawnMin - state.level * 0.04, 0.40, 0.90);
+      const max = clamp(state.spawnMax - state.level * 0.05, 0.65, 1.20);
+      state.spawnTimer = rand(min, max);
+    }
+
+    // move obstacles
+    for (const o of obstacles) o.x -= state.speed * dt;
+    while (obstacles.length && obstacles[0].x + obstacles[0].w < OB_DESPAWN_X) obstacles.shift();
+
+    // collision
+    const px = player.x|0;
+    const py = (player.y - player.h)|0;
+    const hb = {
+      x: px + player.hit.x,
+      y: py + player.hit.y,
+      w: player.hit.w,
+      h: player.hit.h
+    };
+
+    for (const o of obstacles){
+      const ox = o.x|0;
+      const yMid = obstacleY(o);
+      const oy = (yMid - o.h + 2)|0;
+
+      if (aabb(hb.x, hb.y, hb.w, hb.h, ox, oy, o.w, o.h)){
+        state.dead = true;
+        spawnBlood(hb.x + hb.w, hb.y + (hb.h/2));
+        break;
+      }
+    }
+  }
+
+  // ====== DRAW ======
+  function draw(){
+    drawRoad();
+    drawWarnings();
+
+    for (const o of obstacles) drawObstacle(o);
+
+    // sangue sopra gli ostacoli per leggibilità
+    drawBlood();
+
+    // player
+    const x = player.x|0;
+    const y = (player.y - player.h)|0;
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(x+6, y+player.h+2, 10, 1); // shadow
+
+    ctx.drawImage(motoImg, x, y, player.w, player.h);
+
+    if (state.showHitbox){
+      ctx.strokeStyle = "#000";
+      ctx.strokeRect(x + player.hit.x, y + player.hit.y, player.hit.w, player.hit.h);
+    }
+
+    drawHUD();
+  }
+
+  // ====== LOOP ======
+  function loop(ts){
+    if (!state.lastTs) state.lastTs = ts;
+    const dt = (ts - state.lastTs) / 1000;
+    state.lastTs = ts;
+
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  reset();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

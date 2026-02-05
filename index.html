@@ -1,513 +1,59 @@
-<!doctype html>
-<html lang="it">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-
-  <!-- (facoltativo) modalità "app" quando aggiungi alla Home su iPhone -->
-  <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
-
-  <title>Moto Runner — Mobile</title>
-
-  <style>
-    html, body { height: 100%; margin: 0; background:#fff; }
-    body{
-      overflow:hidden;
-      touch-action: none;  /* evita scroll/zoom */
-      user-select:none; -webkit-user-select:none;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
-    }
-    canvas{
-      position:fixed;
-      inset:0;
-      width:100vw;
-      height:100vh;
-      image-rendering: pixelated;
-      image-rendering: crisp-edges;
-      background:#fff;
-    }
-  </style>
-</head>
-
-<body>
-<canvas id="c" aria-label="Moto Runner"></canvas>
-
-<script>
-(() => {
-  const canvas = document.getElementById("c");
-  const ctx = canvas.getContext("2d", { alpha: false });
-
-  // --- Sprites ---
-  const motoImg = new Image();
-
-  // TEST (PNG faccia) -> stesso spazio della moto
-  // IMPORTANT: carica "faccia_scontornata.png" nella root del repo (accanto a index.html)
-  motoImg.src = "faccia_scontornata.png";
-
-  // ORIGINALE MOTO (conservalo qui per tornare indietro quando vuoi)
-  // motoImg.src = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABcAAAASCAYAAACw50UTAAAAkUlEQVR4nLVU0Q6AIBDS5v//sr1Uu50g3Cq2tjQOPDRb8zCvp4QRij9HNzjR2OE/OP4SVuKvo2LiSDjPyU1GrVZXTONSmUeBLBLHsAtX/BZAY9pp3300EOuXeAaYRGZoEfJoqqJdV4rXUeZuTDJzVuQUZPGZ39UfykxmMzIfirAxyFjM2FGsXFLMHG5o9faj/BO3NCgO4jsV/AAAAABJRU5ErkJggg==";
-
-  const ventoImg = new Image();
-  ventoImg.src = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAHCAYAAAAS9422AAAAOklEQVR4nGNkoC74j8RmhBM0MBwOWKhoAQMDqoP/wyzAajMtbKQGwHAsORYQ62NGBgYGBiYyLCAJAADO4gYMc0hvEgAAAABJRU5ErkJggg==";
-
-  // Dimensioni "in gioco" (restano quelle della moto)
-  const SPR = { motoW: 23, motoH: 18, ventoW: 24, ventoH: 7 };
-
-  // --- Pixel world (LANDSCAPE) ---
-  const VW = 260;
-  const VH = 140;
-
-  function resize() {
-    const w = window.innerWidth;
-    const h = window.innerHeight;
-    const s = Math.max(1, Math.floor(Math.min(w / VW, h / VH)));
-    canvas.width  = VW * s;
-    canvas.height = VH * s;
-    ctx.setTransform(s, 0, 0, s, 0, 0);
-    ctx.imageSmoothingEnabled = false;
-  }
-  window.addEventListener("resize", resize, { passive:true });
-  resize();
-
-  // --- Helpers ---
-  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-  const lerp  = (a, b, t) => a + (b - a) * t;
-  const rand  = (a,b) => a + Math.random()*(b-a);
-
-  function aabb(ax, ay, aw, ah, bx, by, bw, bh){
-    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
-  }
-  function isPortrait(){ return window.innerHeight > window.innerWidth; }
-
-  // --- Road (dritta, 3 corsie grafiche ma moto si muove in continuo) ---
-  const LANES = 3;
-  const road = {
-    x: 0,
-    y: ((VH/2)|0) - 45,
-    w: VW,
-    h: 90,
-    shoulder: 8
-  };
-  const laneFracs = [0.28, 0.50, 0.72];
-  function laneY(lane){
-    const l = clamp(lane|0, 0, LANES-1);
-    return (road.y + road.h * laneFracs[l])|0;
-  }
-
-  // --- Game state (velocità adattiva) ---
-  const state = {
-    dead: false,
-    lastTs: 0,
-    score: 0,
-    hi: Number(localStorage.getItem("moto_hi_mobile_slider") || 0),
-
-    level: 0,
-
-    speedBase: 70,
-    speedStep: 14,
-    speedMax: 210,
-    speed: 70,
-
-    spawnTimer: 0,
-    spawnMin: 0.85,
-    spawnMax: 1.35,
-
-    windTimer: 0,
-    windMin: 0.85,
-    windMax: 1.65,
-
-    scroll: 0
-  };
-
-  // --- Player (Y continuo: "slider") ---
-  const player = {
-    x: 26,
-    // y = "bottom" della sprite, coerente col codice precedente
-    y: laneY(1),
-    targetY: laneY(1),
-    w: SPR.motoW,
-    h: SPR.motoH,
-    hit: { x: 5, y: 7, w: Math.max(10, SPR.motoW - 10), h: Math.max(8, SPR.motoH - 10) }
-  };
-
-  function playerMinBottom(){
-    // margine per non uscire dalla strada
-    return (road.y + player.h + 2)|0;
-  }
-  function playerMaxBottom(){
-    return (road.y + road.h - 2)|0;
-  }
-
-  // --- Obstacles (bottiglie pixel, traiettorie varie) ---
-  const obstacles = [];
-  const OB_SPAWN_X = VW + 14;
-  const OB_DESPAWN_X = -40;
-
-  function obstacleSizeForLevel(){
-    const baseW = 6, baseH = 16;
-    const s = clamp(1 + state.level * 0.02, 1, 1.18);
-    return { w: Math.max(5, (baseW*s)|0), h: Math.max(14, (baseH*s)|0) };
-  }
-  function randomLane(){ return (Math.random() * LANES) | 0; }
-
-  function endLaneFor(startLane){
-    if (Math.random() < 0.75){
-      const adj = [];
-      if (startLane > 0) adj.push(startLane - 1);
-      if (startLane < LANES - 1) adj.push(startLane + 1);
-      return adj[(Math.random() * adj.length)|0];
-    } else {
-      let l;
-      do { l = randomLane(); } while (l === startLane);
-      return l;
-    }
-  }
-
-  function makeObstacle(opts = {}){
-    const { w, h } = obstacleSizeForLevel();
-
-    const straightProb = 0.62;
-    const doSwitch = Math.random() > straightProb;
-
-    const startLane = (opts.startLane != null) ? opts.startLane : randomLane();
-    const endLane   = doSwitch ? endLaneFor(startLane) : startLane;
-
-    const j0 = rand(-3, 3);
-    const j1 = rand(-3, 3);
-
-    const y0 = (laneY(startLane) + j0)|0;
-    const y1 = (laneY(endLane) + j1)|0;
-
-    return {
-      x: (opts.x != null ? opts.x : OB_SPAWN_X),
-      x0: OB_SPAWN_X,
-      x1: OB_DESPAWN_X,
-      y0, y1,
-      w, h,
-      curve: Math.random() < 0.35 ? rand(-0.35, 0.35) : 0
-    };
-  }
-
-  function obstacleY(o){
-    const p = clamp((o.x0 - o.x) / (o.x0 - o.x1), 0, 1);
-    let t = p;
-    t = t*t*(3 - 2*t); // easeInOut
-
-    if (o.curve !== 0){
-      const s = Math.sin(p * Math.PI);
-      t = clamp(t + s * o.curve, 0, 1);
-    }
-    return (lerp(o.y0, o.y1, t))|0;
-  }
-
-  function drawObstacle(o){
-    const x = o.x|0;
-    const yMid = obstacleY(o);
-    const y = (yMid - o.h + 2)|0;
-
-    ctx.fillStyle = "#000";
-    ctx.fillRect(x, y+3, o.w, o.h-3);
-    const neckW = Math.max(2, o.w - 2);
-    const neckX = (x + ((o.w-neckW)/2)|0);
-    ctx.fillRect(neckX, y, neckW, 3);
-    ctx.fillRect(neckX, y-1, neckW, 1);
-    ctx.fillRect(x+1, (y+o.h+1)|0, Math.max(2,o.w-1), 1);
-  }
-
-  // --- Wind ---
-  const winds = [];
-  const WIND_SCALE = 0.60;
-  const WIND_MAX = 10;
-
-  function spawnWind(){
-    if (winds.length >= WIND_MAX) return;
-
-    const w = Math.max(1, (SPR.ventoW * WIND_SCALE)|0);
-    const h = Math.max(1, (SPR.ventoH * WIND_SCALE)|0);
-
-    const yMin = road.y + 10;
-    const yMax = road.y + road.h - 24;
-
-    winds.push({
-      x: VW + rand(10, 40),
-      y: (rand(yMin, yMax))|0,
-      w, h,
-      k: rand(0.92, 1.02)
-    });
-  }
-  function drawWind(w){
-    ctx.drawImage(ventoImg, w.x|0, w.y|0, w.w|0, w.h|0);
-  }
-
-  // --- CONTROLLI: "slider" (drag continuo) ---
-  let dragging = false;
-  let activePointerId = null;
-
-  function pointerToWorldY(e){
-    const rect = canvas.getBoundingClientRect();
-    return (e.clientY - rect.top) / rect.height * VH;
-  }
-
-  function setTargetFromPointer(e){
-    const fingerY = pointerToWorldY(e);
-
-    // Allinea il dito circa al centro della sprite:
-    // player.y è il "bottom", quindi bottom = fingerY + h/2
-    const desiredBottom = fingerY + (player.h * 0.5);
-
-    player.targetY = clamp(desiredBottom, playerMinBottom(), playerMaxBottom());
-  }
-
-  canvas.addEventListener("pointerdown", (e) => {
-    e.preventDefault();
-
-    if (isPortrait()) return;
-
-    if (state.dead){
-      reset();
-      return;
-    }
-
-    dragging = true;
-    activePointerId = e.pointerId;
-    canvas.setPointerCapture(activePointerId);
-    setTargetFromPointer(e);
-  }, { passive:false });
-
-  canvas.addEventListener("pointermove", (e) => {
-    if (!dragging) return;
-    if (e.pointerId !== activePointerId) return;
-    e.preventDefault();
-    setTargetFromPointer(e);
-  }, { passive:false });
-
-  function endDrag(e){
-    if (e && e.pointerId !== activePointerId) return;
-    dragging = false;
-    activePointerId = null;
-  }
-
-  canvas.addEventListener("pointerup", (e) => { e.preventDefault(); endDrag(e); }, { passive:false });
-  canvas.addEventListener("pointercancel", (e) => { e.preventDefault(); endDrag(e); }, { passive:false });
-  canvas.addEventListener("pointerleave", (e) => { endDrag(e); }, { passive:true });
-
-  // Debug desktop (freccie)
-  window.addEventListener("keydown", (e) => {
-    if (e.code === "ArrowUp")   player.targetY = clamp(player.targetY - 8, playerMinBottom(), playerMaxBottom());
-    if (e.code === "ArrowDown") player.targetY = clamp(player.targetY + 8, playerMinBottom(), playerMaxBottom());
-    if (e.code === "KeyR") reset();
-  });
-
-  function reset(){
-    state.dead = false;
-    state.score = 0;
-    state.level = 0;
-    state.speed = state.speedBase;
-    state.spawnTimer = rand(state.spawnMin, state.spawnMax);
-    state.windTimer  = rand(state.windMin, state.windMax);
-    state.scroll = 0;
-
-    obstacles.length = 0;
-    winds.length = 0;
-
-    const start = laneY(1);
-    player.y = start;
-    player.targetY = start;
-  }
-
-  // --- Road drawing (pulito, senza granelli) ---
-  function drawRoad(){
-    ctx.fillStyle = "#fff";
-    ctx.fillRect(0,0,VW,VH);
-
-    ctx.strokeStyle = "#000";
-    ctx.lineWidth = 1;
-    ctx.strokeRect(road.x, road.y, road.w, road.h);
-
-    // shoulder lines
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, road.y + road.shoulder, VW, 1);
-    ctx.fillRect(0, road.y + road.h - road.shoulder - 1, VW, 1);
-
-    // separatori corsie (solo grafica)
-    const dashW = 10, gap = 10;
-    const ySep1 = (road.y + road.h * (1/3))|0;
-    const ySep2 = (road.y + road.h * (2/3))|0;
-
-    let dx1 = -((state.scroll|0) % (dashW + gap));
-    while (dx1 < VW){
-      ctx.fillRect(dx1|0, ySep1, dashW, 1);
-      dx1 += dashW + gap;
-    }
-    let dx2 = -(((state.scroll|0) + 8) % (dashW + gap));
-    while (dx2 < VW){
-      ctx.fillRect(dx2|0, ySep2, dashW, 1);
-      dx2 += dashW + gap;
-    }
-
-    // rumble strips
-    const rsGap = 10;
-    let rx = -(((state.scroll|0) + 5) % rsGap);
-    while (rx < VW){
-      ctx.fillRect(rx|0, (road.y + 2)|0, 1, 2);
-      ctx.fillRect(rx|0, (road.y + road.h - 4)|0, 1, 2);
-      rx += rsGap;
-    }
-
-    // guardrail
-    ctx.fillRect(0, (road.y - 6)|0, VW, 1);
-    ctx.fillRect(0, (road.y + road.h + 5)|0, VW, 1);
-
-    const postGap = 16;
-    let px = -(((state.scroll|0) + 3) % postGap);
-    while (px < VW){
-      ctx.fillRect(px|0, (road.y - 10)|0, 1, 4);
-      ctx.fillRect((px+1)|0, (road.y - 9)|0, 1, 1);
-
-      ctx.fillRect(px|0, (road.y + road.h + 6)|0, 1, 4);
-      ctx.fillRect((px+1)|0, (road.y + road.h + 7)|0, 1, 1);
-
-      px += postGap;
-    }
-  }
-
-  function drawHUD(){
-    ctx.fillStyle = "#000";
-    ctx.font = "6px ui-monospace, monospace";
-
-    const s  = Math.floor(state.score).toString().padStart(5,"0");
-    const hi = Math.floor(state.hi).toString().padStart(5,"0");
-    ctx.fillText(`HI ${hi}  ${s}  LV ${state.level}`, 6, 10);
-
-    if (isPortrait()){
-      ctx.font = "8px ui-monospace, monospace";
-      ctx.fillText("RUOTA IL TELEFONO", (VW/2 - 52)|0, (VH/2 - 6)|0);
-      ctx.font = "6px ui-monospace, monospace";
-      ctx.fillText("GIOCO IN ORIZZONTALE", (VW/2 - 64)|0, (VH/2 + 8)|0);
-      return;
-    }
-
-    if (state.dead){
-      ctx.font = "8px ui-monospace, monospace";
-      ctx.fillText("GAME OVER", (VW/2 - 34)|0, (VH/2 - 8)|0);
-      ctx.font = "6px ui-monospace, monospace";
-      ctx.fillText("TAP PER RIPARTIRE", (VW/2 - 44)|0, (VH/2 + 8)|0);
-    }
-  }
-
-  // --- Update ---
-  function update(dt){
-    if (isPortrait()) return;
-    if (state.dead) return;
-
-    state.score += dt * 10;
-    state.level = (state.score / 120) | 0;
-
-    state.speed = Math.min(state.speedMax, state.speedBase + state.level * state.speedStep);
-    state.scroll += state.speed * dt;
-
-    if (state.score > state.hi){
-      state.hi = state.score;
-      localStorage.setItem("moto_hi_mobile_slider", String(Math.floor(state.hi)));
-    }
-
-    // smoothing moto (fluido)
-    player.y = player.y + (player.targetY - player.y) * Math.min(1, dt * 22);
-
-    // spawn ostacoli
-    state.spawnTimer -= dt;
-    if (state.spawnTimer <= 0){
-      obstacles.push(makeObstacle());
-
-      const duoProb = clamp(0.18 + state.level * 0.02, 0.18, 0.40);
-      if (Math.random() < duoProb){
-        // seconda traiettoria, distanziata
-        obstacles.push(makeObstacle({
-          x: OB_SPAWN_X + rand(10, 26),
-          startLane: randomLane()
-        }));
+/* sw.js - cache semplice per offline + riduzione problemi di cache
+   Se fai modifiche grandi, cambia CACHE_VERSION (es. v3 -> v4). */
+const CACHE_VERSION = "moto-runner-v3";
+const CORE = [
+  "./",
+  "./index.html",
+  "./manifest.webmanifest",
+  "./faccia_scontornata.png" // se non c’è, toglila o caricala
+];
+
+self.addEventListener("install", (event) => {
+  self.skipWaiting();
+  event.waitUntil(
+    caches.open(CACHE_VERSION).then((cache) => cache.addAll(CORE).catch(()=>{}))
+  );
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.map(k => (k !== CACHE_VERSION) ? caches.delete(k) : Promise.resolve()));
+    await self.clients.claim();
+  })());
+});
+
+// Network-first per HTML (così vedi gli update), cache-first per assets
+self.addEventListener("fetch", (event) => {
+  const req = event.request;
+  const url = new URL(req.url);
+
+  // solo stessa origin
+  if (url.origin !== self.location.origin) return;
+
+  const isHTML = req.mode === "navigate" || url.pathname.endsWith(".html") || url.pathname.endsWith("/moto-runner/") || url.pathname.endsWith("/moto-runner");
+  if (isHTML) {
+    event.respondWith((async () => {
+      try {
+        const fresh = await fetch(req, { cache: "no-store" });
+        const cache = await caches.open(CACHE_VERSION);
+        cache.put(req, fresh.clone()).catch(()=>{});
+        return fresh;
+      } catch {
+        const cached = await caches.match(req);
+        return cached || caches.match("./index.html");
       }
-
-      const min = clamp(state.spawnMin - state.level * 0.04, 0.40, 0.90);
-      const max = clamp(state.spawnMax - state.level * 0.05, 0.65, 1.20);
-      state.spawnTimer = rand(min, max);
-    }
-
-    // vento
-    state.windTimer -= dt;
-    if (state.windTimer <= 0){
-      spawnWind();
-      const min = clamp(state.windMin + state.level * 0.02, 0.70, 1.30);
-      const max = clamp(state.windMax + state.level * 0.03, 1.20, 2.10);
-      state.windTimer = rand(min, max);
-    }
-
-    // move ostacoli
-    for (const o of obstacles) o.x -= state.speed * dt;
-    while (obstacles.length && obstacles[0].x + obstacles[0].w < OB_DESPAWN_X) obstacles.shift();
-
-    // move vento
-    for (const w of winds) w.x -= (state.speed * w.k) * dt;
-    while (winds.length && winds[0].x + winds[0].w < -40) winds.shift();
-
-    // collision
-    const bikeX = player.x|0;
-    const bikeY = (player.y - player.h)|0;
-
-    const hb = {
-      x: bikeX + player.hit.x,
-      y: bikeY + player.hit.y,
-      w: player.hit.w,
-      h: player.hit.h
-    };
-
-    for (const o of obstacles){
-      const ox = o.x|0;
-      const yMid = obstacleY(o);
-      const oy = (yMid - o.h + 2)|0;
-
-      if (aabb(hb.x, hb.y, hb.w, hb.h, ox, oy, o.w, o.h)){
-        state.dead = true;
-        break;
-      }
-    }
+    })());
+    return;
   }
 
-  // --- Draw ---
-  function draw(){
-    drawRoad();
-
-    for (const w of winds) drawWind(w);
-    for (const o of obstacles) drawObstacle(o);
-
-    const x = player.x|0;
-    const y = (player.y - player.h)|0;
-
-    // ombra
-    ctx.fillStyle = "#000";
-    ctx.fillRect(x+6, (y+player.h+2)|0, 10, 1);
-
-    // sprite "moto" (ora PNG faccia)
-    ctx.drawImage(motoImg, x, y, player.w, player.h);
-
-    drawHUD();
-  }
-
-  // --- Loop ---
-  function loop(ts){
-    if (!state.lastTs) state.lastTs = ts;
-    const dt = Math.min(0.033, (ts - state.lastTs)/1000);
-    state.lastTs = ts;
-
-    update(dt);
-    draw();
-    requestAnimationFrame(loop);
-  }
-
-  reset();
-  requestAnimationFrame(loop);
-})();
-</script>
-</body>
-</html>
+  // assets: cache-first
+  event.respondWith((async () => {
+    const cached = await caches.match(req);
+    if (cached) return cached;
+    const fresh = await fetch(req);
+    const cache = await caches.open(CACHE_VERSION);
+    cache.put(req, fresh.clone()).catch(()=>{});
+    return fresh;
+  })());
+});
